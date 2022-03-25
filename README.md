@@ -1,41 +1,14 @@
 # NOTE
-这个仓库展示了我的项目SewMake的一些功能，主要包含`远程升级``CAD绘图``花型设计``撤销与重做`等功能的展示，由于该项目已经商用，因此不能公开源码，只能展示一些使用功能，还请见谅🙏。
+这个仓库展示了我的项目SewMake的一些功能，主要包含`远程升级`、`CAD绘图`、`花型设计`、`撤销与重做`等功能的展示，由于该项目已经商用，因此不能公开源码，只能展示一些使用功能，还请见谅🙏。
 
 # CAD绘图功能
-SewMake可以像CAD一样设计自己需要的缝纫花型，目前支持的花型包括：`直线``弧线``曲线``矩形``多边形``三点圆``椭圆``中心圆`
-
+SewMake可以像CAD一样设计自己需要的缝纫花型，目前支持的花型包括：`直线`、`弧线`、`曲线`、`矩形`、`多边形`、`三点圆`、`椭圆`、`中心圆`
 <img src="images/CAD绘图.gif" alt="formation flight" width="1920">
 
+# 远程升级
+SewMake在启动的时候会自动检查更新，当然也可以手动更新，下面这幅图展示了它的自动更新功能。
+<img src="images/远程升级.gif" alt="formation flight" width="1920">
 
-
-- The default `DroneModel.CF2X` dynamics are based on [Bitcraze's Crazyflie 2.x nano-quadrotor](https://www.bitcraze.io/documentation/hardware/crazyflie_2_1/crazyflie_2_1-datasheet.pdf)
-
-- Everything after a `$` is entered on a terminal, everything after `>>>` is passed to a Python interpreter
-
-- To better understand how the PyBullet back-end works, refer to its [Quickstart Guide](https://docs.google.com/document/d/10sXEhzFRSnvFcl3XxNGhnD4N2SedqwdAvK3dsihxVUA/edit#heading=h.2ye70wns7io3)
-
-- Suggestions and corrections are very welcome in the form of [issues](https://github.com/utiasDSL/gym-pybullet-drones/issues) and [pull requests](https://github.com/utiasDSL/gym-pybullet-drones/pulls), respectively
-
-> ## Why Reinforcement Learning of Quadrotor Control
-> A lot of recent RL research for continuous actions has focused on [policy gradient algorithms and actor-critic architectures](https://lilianweng.github.io/lil-log/2018/04/08/policy-gradient-algorithms.html). A quadrotor is (i) an easy-to-understand mobile robot platform whose (ii) control can be framed as a continuous states and actions problem but, beyond 1-dimension, (iii) it adds the complexity that many candidate policies lead to unrecoverable states, violating the assumption of the existence of a stationary state distribution on the entailed Markov chain.
-
-
-
-## Overview
-
-|                                   | `gym-pybullet-drones` | [AirSim](https://github.com/microsoft/AirSim) | [Flightmare](https://github.com/uzh-rpg/flightmare) |
-|---------------------------------: | :-------------------: | :-------------------------------------------: | :-------------------------------------------------: |
-|                         *Physics* | PyBullet              | FastPhysicsEngine/PhysX                       | *Ad hoc*/Gazebo                                     |
-|                       *Rendering* | PyBullet              | Unreal Engine 4                               | Unity                                               |
-|                        *Language* | Python                | C++/C#                                        | C++/Python                                          |  
-|           *RGB/Depth/Segm. views* | **Yes**               | **Yes**                                       | **Yes**                                             |
-|             *Multi-agent control* | **Yes**               | **Yes**                                       | **Yes**                                             |
-|                   *ROS interface* | ROS2/Python           | ROS/C++                                       | ROS/C++                                             |
-|            *Hardware-In-The-Loop* | No                    | **Yes**                                       | No                                                  |
-|         *Fully steppable physics* | **Yes**               | No                                            | **Yes**                                             |
-|             *Aerodynamic effects* | Drag, downwash, ground| Drag                                          | Drag                                                |
-|          *OpenAI [`Gym`](https://github.com/openai/gym/blob/master/gym/core.py) interface* | **Yes** | **[Yes](https://github.com/microsoft/AirSim/pull/3215)** | **Yes**                                             |
-| *RLlib [`MultiAgentEnv`](https://github.com/ray-project/ray/blob/master/rllib/env/multi_agent_env.py) interface* | **Yes** | No | No                           |
 
 
 
