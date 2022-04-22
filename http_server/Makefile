@@ -1,9 +1,9 @@
 TARGET = http_server
 INC_PATH = -I./
 CC = g++
-CFLAGS = -std=c++11 -O0 -Wall -c $(INC_PATH) -g
+CFLAGS = -std=c++17 -O0 -Wall -c $(INC_PATH) -g
 LD = g++
-LDFLAGS = -std=c++11 -levent
+LDFLAGS = -std=c++17 -lpthread
 REMOVE = -rm -rf
 
 TOP_DIR = $(shell pwd)

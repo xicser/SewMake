@@ -68,7 +68,7 @@ class HttpMsgParser
 {
 public:
     void tryDecode(const string& buf);
-	void tryDecode(const char *buf, int size);
+    void tryDecode(const char *buf, int size);
     const string& getMethod() const;
     const string& getUrl() const;
     const unordered_map<string, string>& getRequestParams() const;
