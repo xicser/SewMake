@@ -59,9 +59,11 @@ int get_entry(const char *path, char *out_buffer)
 {
     int is_root = 0;
     DIR *dp;
-    struct dirent *dentry;
     char tmpstr[4096];
     char enstr[4096];
+
+    struct dirent *dp1 = (struct dirent *)malloc(sizeof(struct dirent));
+    struct dirent *dentry = (struct dirent *)malloc(sizeof(struct dirent));
 
     dp = opendir(path);
     if (dp == NULL) {
@@ -78,7 +80,12 @@ int get_entry(const char *path, char *out_buffer)
     cnt += sprintf(out_buffer + cnt, "<body><h1>当前目录: %s</h1><table>", path);
 
     while (1) {
-        dentry = readdir(dp);
+        int ret = readdir_r(dp, dp1, &dentry);
+        if (ret != 0) {
+            perror("readdir_r");
+            exit(EXIT_FAILURE);
+        }
+
         if (dentry == NULL) {
             break;
         }
@@ -125,6 +132,9 @@ int get_entry(const char *path, char *out_buffer)
     cnt += sprintf(out_buffer + cnt, "</table></body></html>");
 
     closedir(dp);
+
+    free(dp1);
+    free(dentry);
 
     return cnt;
 }

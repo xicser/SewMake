@@ -3,7 +3,7 @@
 
 #include <stdio.h>
 
-//#define LOG_ENABLE
+#define LOG_ENABLE
 
 #ifdef LOG_ENABLE
     #define LOG_PRINT(...) printf(__VA_ARGS__)

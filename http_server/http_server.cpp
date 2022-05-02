@@ -1,7 +1,9 @@
 #include "http_server.h"
 
-int HttpServer::epollfd;       //epoll句柄
-HttpServer::HttpServer(int backlog, int serverPort, int threadCount, string workDir) : threadpool(threadCount)
+int HttpServer::epollfd;
+HttpServer::EventInfoBlock_t HttpServer::g_events[MAX_LISTEN_EVENTS + 1];
+
+HttpServer::HttpServer(int backlog, int serverPort, int threadCount, string workDir)
 {
     this->backlog = backlog;
     this->serverPort = serverPort;
@@ -66,14 +68,8 @@ void HttpServer::serverInit(void)
     fcntl(listenSockfd, F_SETFL, flag);
 
     //把监听fd挂到红黑树上, 设置成边沿触发方式
-    struct epoll_event event;
-    event.events = EPOLLIN | EPOLLET;
-    event.data.fd = listenSockfd;
-    ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, listenSockfd, &event);
-    if (ret == -1) {
-        perror("epoll_ctl error");
-        exit(2);
-    }
+    eventSet(&g_events[MAX_LISTEN_EVENTS], listenSockfd, acceptConn, &g_events[MAX_LISTEN_EVENTS]);
+    eventAdd(epollfd, EPOLLIN | EPOLLET, &g_events[MAX_LISTEN_EVENTS]);
 }
 
 /* 运行http服务器 */
@@ -82,130 +78,160 @@ void HttpServer::run(void)
     while (1) {
         int ready = epoll_wait(epollfd, eventReady, EVENT_READY_CNT, -1);
         if (ready == -1) {
-            if (errno != EINTR) {
+            if (errno != EINTR && errno != ECONNABORTED) {
                 perror("epoll_wait error");
+                exit(3);
             }
-            exit(3);
         }
 
-        LOG_PRINT("find new event...\n");
-        for (int i = 0; i < ready; i++) {
-            int fdCurrent = eventReady[i].data.fd;
+        LOG_PRINT("get new event...\n");
+        for (int i = 0; i < ready; i++)
+        {
+            //eventadd()函数中, 添加到监听树中监听事件的时候将EventInfoBlock_t结构体类型给了ptr指针
+            //这里epoll_wait返回的时候, 同样会返回对应fd的EventInfoBlock_t类型的指针
+            EventInfoBlock_t *ev = (EventInfoBlock_t *)eventReady[i].data.ptr;
 
-            //新连接
-            if (fdCurrent == listenSockfd) {
-                threadpool.push_task([=](int listenSockfd) {
-                    struct sockaddr_in client_addr; //返回链接客户端地址信息, 含IP地址和端口号
-                    socklen_t client_addr_len = sizeof(client_addr);
-
-                    while (1) {
-                        int commfd = accept(listenSockfd, (struct sockaddr *)&client_addr, &client_addr_len);
-                        if (commfd == -1) {
-                            break;
-                        }
-
-#ifdef LOG_ENABLE
-                        //打印一下连接上的客户端的信息
-                        printf("commfd = %d, ", commfd);
-                        char ip_str[25];
-                        printf("ip = %s, port = %d connected\n",
-                                inet_ntop(AF_INET, &client_addr.sin_addr.s_addr, ip_str, sizeof(ip_str)), 
-                                ntohs(client_addr.sin_port));
-#endif
-
-                        //把这个通信套接字设置成非阻塞
-                        int flag = fcntl(commfd, F_GETFL);
-                        flag |= O_NONBLOCK;
-                        fcntl(commfd, F_SETFL, flag);
-
-                        //把这个通信套接字加到红黑树上, 设置成边沿触发方式
-                        struct epoll_event event;
-                        event.events = EPOLLIN | EPOLLET;
-                        event.data.fd = commfd;
-                        int ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, commfd, &event);
-                        if (ret == -1) {
-                            perror("epoll_ctl error");
-                            exit(2);
-                        }
-                    }
-
-                    LOG_PRINT("accept done...\n");
-                }, listenSockfd);
+            //如果发生的是读事件, 并且监听的是读事件
+            if ((eventReady[i].events & EPOLLIN) && (ev->events & EPOLLIN))
+            {
+                threadpool.append(ev);
             }
-            //通信
-            else {
-                threadpool.push_task([=](int commSockfd) {
-                    //读数据
-                    int len = 0;
-                    char buf[1024 * 10];
-
-                    LOG_PRINT("start read...\n");
-                    while (1) {
-
-                        int ret = read(commSockfd, buf, 1024);
-                        if (ret == -1) {
-                            break;
-                        }
-
-                        //对端关闭, 进入close_wait状态
-                        if (ret == 0) {
-
-                            //删除该监听结点
-                            ret = epoll_ctl(epollfd, EPOLL_CTL_DEL, commSockfd, NULL);
-                            if (ret == -1) {
-                                perror("epoll_ctl error");
-                                exit(2);
-                            }
-                            LOG_PRINT("connect closed\n");
-                            close(commSockfd);
-                            return;
-                        }
-                        len += ret;
-                    }
-
-                    buf[len] = 0;
-                    //测试
-                    LOG_PRINT("read content: \n%s", buf);
-
-                    //http解析
-                    HttpMsgParser parser;
-                    parser.tryDecode(buf, len);
-
-#ifdef LOG_ENABLE
-                    unordered_map<string, string> header = parser.getHeaders();
-                    printf("headers:\n");
-                    for (auto it : header) {
-                        printf("%s ============ %s\n", it.first.c_str(), it.second.c_str());
-                    }
-#endif
-                    const string& method = parser.getMethod();
-                    const string& url = parser.getUrl();
-
-                    //转码 将不能识别的中文乱码 -> 中文
-                    //解码 %23 %34 %5f
-                    char path[256];
-                    strcpy(path, url.c_str());
-                    decode_str(path, path);
-
-                    if (method == "GET") {
-                        const char *filepath;
-                        if (strcmp(url.c_str(), "/") == 0) {
-                            filepath = ".";
-                        }
-                        else {
-                            filepath = path + 1;
-                        }
-
-                        LOG_PRINT("got [%s] request from browser...\n\n", filepath);
-                        doHttpRequest(commSockfd, filepath);
-                    }
-                    else {
-                        LOG_PRINT("unrecognized request\n");
-                    }
-                }, fdCurrent);
+            //如果发生的是写事件, 并且监听的是写事件
+            if ((eventReady[i].events & EPOLLOUT) && (ev->events & EPOLLOUT))
+            {
+                threadpool.append(ev);
             }
         }
     }
+}
+
+/* 当有文件描述符就绪, epoll返回, 调用该函数与客户端建立链接 */
+void HttpServer::acceptConn(int lfd, int events, void *arg)
+{
+    struct sockaddr_in client_addr; //返回链接客户端地址信息, 含IP地址和端口号
+    socklen_t client_addr_len = sizeof(client_addr);
+
+    while (1) {
+        int commfd = accept(lfd, (struct sockaddr *)&client_addr, &client_addr_len);
+        if (commfd == -1 && errno == EAGAIN) {
+            break;
+        }
+
+#ifdef LOG_ENABLE
+        //打印一下连接上的客户端的信息
+        printf("commfd = %d, ", commfd);
+        char ip_str[25];
+        printf("ip = %s, port = %d connected\n",
+                inet_ntop(AF_INET, &client_addr.sin_addr.s_addr, ip_str, sizeof(ip_str)), 
+                ntohs(client_addr.sin_port));
+#endif
+
+        //把这个通信套接字加到红黑树上, 设置成边沿触发方式
+        //从全局数组g_events中找一个空闲位置
+        int i = 0;
+        for (; i < MAX_LISTEN_EVENTS; i++)
+        {
+            if (g_events[i].status == 0) {
+                break;
+            }
+        }
+        if (i == MAX_LISTEN_EVENTS) // 超出连接数上限
+        {
+            printf("%s: max connect limit[%d]\n", __func__, MAX_LISTEN_EVENTS);
+            break;
+        }
+
+        //把这个通信套接字设置成非阻塞
+        int flag = fcntl(commfd, F_GETFL);
+        flag |= O_NONBLOCK;
+        fcntl(commfd, F_SETFL, flag);
+
+        //找到合适的节点之后, 将其添加到监听树中, 并监听读事件
+        eventSet(&g_events[i], commfd, recvData, &g_events[i]);
+        eventAdd(epollfd, EPOLLIN | EPOLLET, &g_events[i]);
+
+        LOG_PRINT("new connect[%s:%d], pos[%d]\n\n", inet_ntoa(client_addr.sin_addr),
+            ntohs(client_addr.sin_port), i);
+    }
+}
+
+/* 接收数据 */
+void HttpServer::recvData(int fd, int events, void *arg)
+{
+    EventInfoBlock_t *ev = (EventInfoBlock_t *)arg;
+    int len = 0;
+
+    while (1) {
+
+        int ret = read(fd, ev->buf, 1024);
+        if (ret == -1 && errno == EAGAIN) {
+            break;
+        }
+
+        //对端关闭, 进入close_wait状态
+        if (ret == 0) {
+            break;
+        }
+        len += ret;
+    }
+
+    eventDel(epollfd, ev);                            //将该节点从红黑树上摘除
+
+    if (len > 0)
+    {
+        ev->len = len;
+        ev->buf[len] = '\0';                          //手动添加字符串结束标记
+
+        eventSet(ev, fd, sendData, ev);               //设置该fd对应的回调函数为senddata
+        eventAdd(epollfd, EPOLLOUT | EPOLLET, ev);    //将fd加入红黑树中, 监听其写事件
+    }
+    else if (len == 0)
+    {
+        close(ev->fd);
+        LOG_PRINT("[fd=%d] pos[%ld], closed\n", fd, ev-g_events);
+    }
+}
+
+/* 发送数据 */
+void HttpServer::sendData(int fd, int events, void *arg)
+{
+    EventInfoBlock_t *ev = (EventInfoBlock_t *)arg;
+
+    //http解析
+    HttpMsgParser parser;
+    parser.tryDecode(ev->buf, ev->len);
+
+    //测试
+    //LOG_PRINT("read content: [%d]:\n%s\n", fd, ev->buf);
+
+    const string& method = parser.getMethod();
+    const string& url = parser.getUrl();
+
+    //转码 将不能识别的中文乱码 -> 中文
+    //解码 %23 %34 %5f
+    char path[256];
+    strcpy(path, url.c_str());
+    decode_str(path, path);
+
+    if (method == "GET") {
+        const char *filepath;
+        if (strcmp(url.c_str(), "/") == 0) {
+            filepath = ".";
+        }
+        else {
+            filepath = path + 1;
+        }
+
+        LOG_PRINT("got [%s] request from browser...\n\n", filepath);
+        doHttpRequest(fd, filepath);
+    }
+    else {
+        printf("unrecognized request\n");
+    }
+
+    eventDel(epollfd, ev);                        //从红黑树中移除
+    eventSet(ev, fd, recvData, ev);               //将该fd的回调函数改为recvdata
+    eventAdd(epollfd, EPOLLIN | EPOLLET, ev);     //重新添加到红黑树上, 设为监听读事件
 }
 
 /* 构造http回复报文头 */
@@ -314,6 +340,53 @@ void HttpServer::doHttpRequest(int commSockfd, const char *filepath)
 
         //发送目录信息
         doSendDir(commSockfd, filepath);
+    }
+}
+
+/* 设置一个EventInfoBlock的内容 */
+void HttpServer::eventSet(EventInfoBlock_t *ev, int fd, void (*call_back)(int fd,int events,void *arg), void *arg)
+{
+    ev->fd = fd;
+    ev->call_back = call_back;
+    ev->events = 0;
+    ev->arg = arg;
+    ev->status = 0;
+    if(ev->len <= 0) {
+        memset(ev->buf, 0, sizeof(ev->buf));
+        ev->len = 0;
+    }
+}
+
+/* 向 epoll监听的红黑树 添加一个文件描述符 */
+void HttpServer::eventAdd(int efd, int events, EventInfoBlock_t *ev)
+{
+    struct epoll_event epv = {0, {0}};
+    int op = 0;
+    epv.data.ptr = ev;           // ptr指向一个结构体（之前的epoll模型红黑树上挂载的是文件描述符cfd和lfd，现在是ptr指针）
+    epv.events = ev->events = events; //EPOLLET + EPOLLIN 或 EPOLLOUT
+    if (ev->status == 0)         //status 说明文件描述符是否在红黑树上: 0不在, 1 在
+    {
+        op = EPOLL_CTL_ADD;      //将其加入红黑树g_efd, 并将status置1
+        ev->status = 1;
+    }
+    if (epoll_ctl(efd, op, ev->fd, &epv) < 0) // 添加一个节点
+    {
+        printf("event add failed [fd=%d], events[%d]\n", ev->fd, events);
+        perror("epoll_ctl add error");
+    }
+}
+
+/* 从epoll 监听的 红黑树中删除一个文件描述符 */
+void HttpServer::eventDel(int efd, EventInfoBlock_t *ev)
+{
+    struct epoll_event epv = {0, {0}};
+    if(ev->status != 1) //如果fd没有添加到监听树上, 就不用删除，直接返回
+        return;
+    epv.data.ptr = NULL;
+    ev->status = 0;
+    if (epoll_ctl(efd, EPOLL_CTL_DEL, ev->fd, &epv) < 0)
+    {
+        perror("epoll_ctl del error");
     }
 }
 
