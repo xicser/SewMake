@@ -44,36 +44,38 @@ public:
 private:
     void serverInit(void);
 
-    static int  httpBuildResponseMsgHeader(int no, const char *describe, const char *type, int len, char *out_buffer);
-    static int  httpBuildErrorMsg(int no, const char *describe, const char *text, char *out_buffer);
-    static void doSendError(int commSockfd, int no, const char *describe, const char *text);
-    static void doSendFile(int commSockfd, const char *filepath);
-    static void doSendDir(int commSockfd, const char *dirname);
-    static void doHttpRequest(int commSockfd, const char *filepath);
-
     //描述就绪文件描述符的相关信息
     typedef struct
     {
-        int fd;             //要监听的文件描述符
-        int events;         //对应的监听事件, EPOLLET + EPOLLIN和EPLLOUT
+        int  fd;            //要监听的文件描述符
+        int  events;        //对应的监听事件, EPOLLET, EPOLLIN, EPLLOUT等
         void *arg;          //指向自己结构体指针
         void (*call_back)(int fd, int events, void *arg); //回调函数
-        int status;         //是否在监听: 1->在红黑树上(监听), 0->不在(不监听)
-        char buf[EVENT_INFO_BUFFLEN];
-        int len;
+        int  status;        //是否在监听: 1->在红黑树上(监听), 0->不在(不监听)
+        char recvbuf[EVENT_INFO_BUFFLEN];
+        int  recvlen;
+        char sendbuf[EVENT_INFO_BUFFLEN];
+        int  sendlen;
     } EventInfoBlock_t;
+
+    static int  httpBuildResponseMsgHeader(int no, const char *describe, const char *type, int len, char *out_buffer);
+    static int  httpBuildErrorMsg(int no, const char *describe, const char *text, char *out_buffer);
+    static int  httpBuildFile(const char *filepath, char* outerBuffer);
+    static int  httpBuildDir(const char *dirpath, char* outerBuffer);
+    static void doHttpRequest(EventInfoBlock_t *);
+
 
     static EventInfoBlock_t g_events[MAX_LISTEN_EVENTS + 1];    //g_events[MAX_LISTEN_EVENTS]位置是监听套接字的EventInfoBlock
 
     //设置一个EventInfoBlock的内容
-    static void eventSet(EventInfoBlock_t *ev, int fd, void (*call_back)(int fd,int events, void *arg), void *arg);
+    static void eventSet(EventInfoBlock_t *ev, int fd, int rlen, int wlen, void (*call_back)(int fd, int events, void *arg), void *arg);
     static void eventAdd(int efd, int events, EventInfoBlock_t *ev);  //向 epoll监听的红黑树 添加一个文件描述符
     static void eventDel(int efd, EventInfoBlock_t *ev);                 //从epoll 监听的 红黑树中删除一个文件描述符
     static void acceptConn(int lfd, int events, void *arg);    //当有文件描述符就绪, epoll返回, 调用该函数与客户端建立链接
 
-    static void recvData(int fd, int events, void *arg);           //接收数据
-    static void sendData(int fd, int events, void *arg);           //发送数据
-
+    static void recvDataAndCope(int fd, int events, void *arg);           //接收数据并处理
+    static void sendData(int fd, int events, void *arg);                  //发送数据
+    static void setFileDescriptor(int fd, bool nonblock);                 //设置文件描述符属性
 
     string workDir;           //工作目录
     int listenSockfd;         //监听套接字

@@ -63,12 +63,10 @@ void HttpServer::serverInit(void)
     }
 
     //把监听fd设置成非阻塞方式
-    int flag = fcntl(listenSockfd, F_GETFL);
-    flag |= O_NONBLOCK;
-    fcntl(listenSockfd, F_SETFL, flag);
+    setFileDescriptor(listenSockfd, true);
 
     //把监听fd挂到红黑树上, 设置成边沿触发方式
-    eventSet(&g_events[MAX_LISTEN_EVENTS], listenSockfd, acceptConn, &g_events[MAX_LISTEN_EVENTS]);
+    eventSet(&g_events[MAX_LISTEN_EVENTS], listenSockfd, -1, -1, acceptConn, &g_events[MAX_LISTEN_EVENTS]);
     eventAdd(epollfd, EPOLLIN | EPOLLET, &g_events[MAX_LISTEN_EVENTS]);
 }
 
@@ -84,7 +82,6 @@ void HttpServer::run(void)
             }
         }
 
-        LOG_PRINT("get new event...\n");
         for (int i = 0; i < ready; i++)
         {
             //eventadd()函数中, 添加到监听树中监听事件的时候将EventInfoBlock_t结构体类型给了ptr指针
@@ -95,11 +92,13 @@ void HttpServer::run(void)
             if ((eventReady[i].events & EPOLLIN) && (ev->events & EPOLLIN))
             {
                 threadpool.append(ev);
+            //    ev->call_back(ev->fd, eventReady[i].events, ev->arg);
             }
             //如果发生的是写事件, 并且监听的是写事件
-            if ((eventReady[i].events & EPOLLOUT) && (ev->events & EPOLLOUT))
+            else if ((eventReady[i].events & EPOLLOUT) && (ev->events & EPOLLOUT))
             {
                 threadpool.append(ev);
+            //    ev->call_back(ev->fd, eventReady[i].events, ev->arg);
             }
         }
     }
@@ -113,7 +112,7 @@ void HttpServer::acceptConn(int lfd, int events, void *arg)
 
     while (1) {
         int commfd = accept(lfd, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (commfd == -1 && errno == EAGAIN) {
+        if ((commfd == -1 && errno == EAGAIN) || (commfd == -1 && errno == EWOULDBLOCK)) {
             break;
         }
 
@@ -121,7 +120,7 @@ void HttpServer::acceptConn(int lfd, int events, void *arg)
         //打印一下连接上的客户端的信息
         printf("commfd = %d, ", commfd);
         char ip_str[25];
-        printf("ip = %s, port = %d connected\n",
+        printf("ip = %s, port = %d connected\n\n",
                 inet_ntop(AF_INET, &client_addr.sin_addr.s_addr, ip_str, sizeof(ip_str)), 
                 ntohs(client_addr.sin_port));
 #endif
@@ -141,30 +140,30 @@ void HttpServer::acceptConn(int lfd, int events, void *arg)
             break;
         }
 
+        //清空写入写出缓冲buffer
+        g_events[i].recvlen = 0;
+        g_events[i].sendlen = 0;
+
         //把这个通信套接字设置成非阻塞
-        int flag = fcntl(commfd, F_GETFL);
-        flag |= O_NONBLOCK;
-        fcntl(commfd, F_SETFL, flag);
+        setFileDescriptor(commfd, true);
 
         //找到合适的节点之后, 将其添加到监听树中, 并监听读事件
-        eventSet(&g_events[i], commfd, recvData, &g_events[i]);
-        eventAdd(epollfd, EPOLLIN | EPOLLET, &g_events[i]);
-
-        LOG_PRINT("new connect[%s:%d], pos[%d]\n\n", inet_ntoa(client_addr.sin_addr),
-            ntohs(client_addr.sin_port), i);
+        eventSet(&g_events[i], commfd, -1, -1, recvDataAndCope, &g_events[i]);
+        eventAdd(epollfd, EPOLLIN | EPOLLET | EPOLLONESHOT, &g_events[i]);
     }
 }
 
-/* 接收数据 */
-void HttpServer::recvData(int fd, int events, void *arg)
+/* 接收数据并处理 */
+void HttpServer::recvDataAndCope(int fd, int events, void *arg)
 {
     EventInfoBlock_t *ev = (EventInfoBlock_t *)arg;
     int len = 0;
 
+    int readStep = 1024;
     while (1) {
 
-        int ret = read(fd, ev->buf, 1024);
-        if (ret == -1 && errno == EAGAIN) {
+        int ret = read(fd, ev->recvbuf + len, readStep);
+        if ((ret == -1 && errno == EAGAIN) || (ret == -1 && errno == EWOULDBLOCK)) {
             break;
         }
 
@@ -177,19 +176,27 @@ void HttpServer::recvData(int fd, int events, void *arg)
 
     eventDel(epollfd, ev);                            //将该节点从红黑树上摘除
 
-    if (len > 0)
-    {
-        ev->len = len;
-        ev->buf[len] = '\0';                          //手动添加字符串结束标记
-
-        eventSet(ev, fd, sendData, ev);               //设置该fd对应的回调函数为senddata
-        eventAdd(epollfd, EPOLLOUT | EPOLLET, ev);    //将fd加入红黑树中, 监听其写事件
-    }
-    else if (len == 0)
-    {
+    if (len == 0) {
+        //对端关闭
         close(ev->fd);
-        LOG_PRINT("[fd=%d] pos[%ld], closed\n", fd, ev-g_events);
+        LOG_PRINT("client [fd=%d] pos[%ld], closed\n\n\n", fd, ev-g_events);
+
+        return;
     }
+
+    ev->recvlen = len;
+
+#ifdef LOG_ENABLE
+        //LOG_PRINT("read content\n\n");
+        //ev->recvbuf[len] = '\0';
+        //LOG_PRINT("read content: [%d]:\n%s\n", fd, ev->recvbuf);
+#endif
+
+    /* 业务逻辑处理 */
+    doHttpRequest(ev);
+
+    eventSet(ev, fd, 0, -1, sendData, ev);              //设置该fd对应的回调函数为sendData
+    eventAdd(epollfd, EPOLLOUT | EPOLLONESHOT, ev);     //将fd加入红黑树中, 监听其写事件
 }
 
 /* 发送数据 */
@@ -197,41 +204,38 @@ void HttpServer::sendData(int fd, int events, void *arg)
 {
     EventInfoBlock_t *ev = (EventInfoBlock_t *)arg;
 
-    //http解析
-    HttpMsgParser parser;
-    parser.tryDecode(ev->buf, ev->len);
+    //把这个通信套接字设置成阻塞
+    setFileDescriptor(fd, false);
 
-    //测试
-    //LOG_PRINT("read content: [%d]:\n%s\n", fd, ev->buf);
+    //写回
+    write(fd, ev->sendbuf, ev->sendlen);
 
-    const string& method = parser.getMethod();
-    const string& url = parser.getUrl();
+    //把这个通信套接字设置成非阻塞
+    setFileDescriptor(fd, true);
 
-    //转码 将不能识别的中文乱码 -> 中文
-    //解码 %23 %34 %5f
-    char path[256];
-    strcpy(path, url.c_str());
-    decode_str(path, path);
-
-    if (method == "GET") {
-        const char *filepath;
-        if (strcmp(url.c_str(), "/") == 0) {
-            filepath = ".";
-        }
-        else {
-            filepath = path + 1;
-        }
-
-        LOG_PRINT("got [%s] request from browser...\n\n", filepath);
-        doHttpRequest(fd, filepath);
-    }
-    else {
-        printf("unrecognized request\n");
-    }
+#ifdef LOG_ENABLE
+    //ev->sendbuf[ev->sendlen] = 0;
+    //LOG_PRINT("send content : \n%s\n", ev->sendbuf);
+#endif
 
     eventDel(epollfd, ev);                        //从红黑树中移除
-    eventSet(ev, fd, recvData, ev);               //将该fd的回调函数改为recvdata
-    eventAdd(epollfd, EPOLLIN | EPOLLET, ev);     //重新添加到红黑树上, 设为监听读事件
+    eventSet(ev, fd, 0, 0, recvDataAndCope, ev);  //将该fd的回调函数改为recvData
+    eventAdd(epollfd, EPOLLIN | EPOLLET | EPOLLONESHOT, ev);     //重新添加到红黑树上, 设为监听读事件
+}
+
+/* 设置文件描述符属性 */
+void HttpServer::setFileDescriptor(int fd, bool nonblock)
+{
+    //把这个通信套接字设置成非阻塞
+    int flag = fcntl(fd, F_GETFL);
+
+    if (nonblock == true) {
+        flag |= O_NONBLOCK;
+    }
+    else {
+        flag &= ~(O_NONBLOCK);;
+    }
+    fcntl(fd, F_SETFL, flag); 
 }
 
 /* 构造http回复报文头 */
@@ -266,94 +270,127 @@ int HttpServer::httpBuildErrorMsg(int no, const char *describe, const char *text
     return cnt;
 }
 
-/* 发送错误信息 */
-void HttpServer::doSendError(int commSockfd, int no, const char *describe, const char *text)
-{
-    char reply_buffer[1024 * 10];
-    int len = httpBuildErrorMsg(no, describe, text, reply_buffer);
-    write(commSockfd, reply_buffer, len);
-}
-
-/* 发送文件内容 */
-void HttpServer::doSendFile(int commSockfd, const char *filepath)
+/* 填充文件内容 */
+int HttpServer::httpBuildFile(const char *filepath, char* outerBuffer)
 {
     //打开文件
     int fd = open(filepath, O_RDONLY);
     if(fd == -1) {
-        //回发浏览器 404 错误页面
-        doSendError(commSockfd, 404, "Not Found", "No such file or directory");
-        return;
+        int len = httpBuildErrorMsg(404, "Not Found", "No such file or directory", outerBuffer);
+        return len;
     }
 
-    //循环读文件
-    char buf[4096];
+    //读文件
     int len = 0;
-    while ( (len = read(fd, buf, sizeof(buf))) > 0 ) {
-        write(commSockfd, buf, len);
-    }
-    if (len == -1) {
-        perror("read file error");
-        exit(1);
+    while (1) {
+        int ret = read(fd, outerBuffer + len, 1024);
+        if (len == -1) {
+            perror("read file error");
+            break;
+        }
+
+        if (ret == 0) {
+            break;
+        }
+        else {
+            len += ret;
+        }
     }
 
     close(fd);
+
+    return len;
 }
 
-/* 发送目录内容 */
-void HttpServer::doSendDir(int commSockfd, const char *dirname)
+/* 填充目录内容 */
+int HttpServer::httpBuildDir(const char *dirpath, char* outerBuffer)
 {
-    char reply_buffer[1024 * 10];
-    int len = get_entry(dirname, reply_buffer);
-    write(commSockfd, reply_buffer, len);
+    int len = get_entry(dirpath, outerBuffer);
+    return len;
 }
 
-/* 处理http请求, 判断文件是否存在, 回发 */
-void HttpServer::doHttpRequest(int commSockfd, const char *filepath)
+/* 处理http请求 */
+void HttpServer::doHttpRequest(EventInfoBlock_t *ev)
 {
-    char reply_buffer[1024 * 10];
     struct stat sbuf;
+    const char *filepath;
+
+    //http解析
+    HttpMsgParser parser;
+    parser.tryDecode(ev->recvbuf, ev->recvlen);
+
+    const string& method = parser.getMethod();
+    const string& url = parser.getUrl();
+
+    //转码 将不能识别的中文乱码 -> 中文
+    //解码 %23 %34 %5f
+    char path[256];
+    strcpy(path, url.c_str());
+    decode_str(path, path);
+
+    if (method == "GET") {
+        if (strcmp(url.c_str(), "/") == 0) {
+            filepath = ".";
+        }
+        else {
+            filepath = path + 1;
+        }
+    }
+    else {
+        printf("unrecognized request\n");
+        int len = httpBuildErrorMsg(405, "Not Found", "Can not cope your request", ev->sendbuf);
+        ev->sendlen += len;
+        return;
+    }
 
     //判断 文件/目录 是否存在
     int ret = stat(filepath, &sbuf);
     if (ret != 0) {
         //回发浏览器 404 错误页面
-        doSendError(commSockfd, 404, "Not Found", "No such file or directory");
+        int len = httpBuildErrorMsg(404, "Not Found", "No such file or directory", ev->sendbuf);
+        ev->sendlen += len;
         return;
     }
 
     //文件
     if (S_ISREG(sbuf.st_mode)) {
 
-        //构造回发报文头, 写数据给客户端
-        int len = httpBuildResponseMsgHeader(200, "OK", get_file_type(filepath), sbuf.st_size, reply_buffer);
-        write(commSockfd, reply_buffer, len);
+        //构造回发报文头
+        int len = httpBuildResponseMsgHeader(200, "OK", get_file_type(filepath), sbuf.st_size, ev->sendbuf);
+        ev->sendlen += len;
 
-        //发送文件内容
-        doSendFile(commSockfd, filepath);
+        //填充文件内容
+        len = httpBuildFile(filepath, ev->sendbuf + ev->sendlen);
+        ev->sendlen += len;
     }
     //目录
     else if (S_ISDIR(sbuf.st_mode)) {
 
-        //构造回发报文头, 写数据给客户端
-        int len = httpBuildResponseMsgHeader(200, "OK", get_file_type(".html"), -1, reply_buffer);
-        write(commSockfd, reply_buffer, len);
+        //构造回发报文头
+        int len = httpBuildResponseMsgHeader(200, "OK", get_file_type(".html"), -1, ev->sendbuf);
+        ev->sendlen += len;
 
-        //发送目录信息
-        doSendDir(commSockfd, filepath);
+        //填充目录内容
+        len = httpBuildDir(filepath, ev->sendbuf + ev->sendlen);
+        ev->sendlen += len;
     }
 }
 
 /* 设置一个EventInfoBlock的内容 */
-void HttpServer::eventSet(EventInfoBlock_t *ev, int fd, void (*call_back)(int fd,int events,void *arg), void *arg)
+void HttpServer::eventSet(EventInfoBlock_t *ev, int fd, int rlen, int wlen,
+                            void (*call_back)(int fd,int events,void *arg), void *arg)
 {
     ev->fd = fd;
     ev->call_back = call_back;
     ev->events = 0;
     ev->arg = arg;
     ev->status = 0;
-    if(ev->len <= 0) {
-        memset(ev->buf, 0, sizeof(ev->buf));
-        ev->len = 0;
+    if(rlen != -1) {
+        ev->recvlen = rlen;
+    }
+
+    if (wlen != -1) {
+        ev->sendlen = wlen;
     }
 }
 
