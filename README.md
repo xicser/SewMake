@@ -4,9 +4,7 @@
 
 - 目录说明：
   > `web_server`：远程升级用的web服务器部分源代码。
-
   > `sew_client`：客户端软件部分源代码。
-
   > `images`：本README.md相关图片资源文件。
 
 - 下面的动图如果看不清，您可以点击图片<font color=#FF0000 > 放大 </font>查看。
@@ -74,7 +72,7 @@ SewMake在启动的时候会自动检查更新，当然也可以手动更新，�
 
 ## 撤销和重做
 <center  class="half">
-    <img src="images/原理说明/撤销和重做.png" alt="formation flight" width="800">
+    <img src="images/原理说明/撤销和重做.png" alt="formation flight" width="500">
 </center>
 
 - 每次在改变当前画板内容之前，先保存当前画板状态到undo栈，以便后续能够撤销。同时清空redo栈。
@@ -83,9 +81,22 @@ SewMake在启动的时候会自动检查更新，当然也可以手动更新，�
 
 ## CAD绘图状态机
 <center  class="half">
-    <img src="images/原理说明/撤销和重做.png" alt="formation flight" width="800">
+    <img src="images/原理说明/CAD绘图机制.png" alt="formation flight" width="400">
+    <img src="images/原理说明/CAD绘图演示.gif" alt="formation flight" width="445">
 </center>
 
-- 每次在改变当前画板内容之前，先保存当前画板状态到undo栈，以便后续能够撤销。同时清空redo栈。
-- 撤销undo操作：当前画板状态压入redo栈，undo栈弹出一个状态s，把当前画板状态设置为状态s。
-- 重做redo操作：当前画板状态压入undo栈，redo栈弹出一个状态s，把当前画板状态设置为状态s。
+- 作图采用状态机原理，现以绘制三点圆为例，说明该状态机的实现原理。
+- 通过分析，枚举出绘制三点圆的所有状态：
+<center  class="half">
+    <img src="images/原理说明/三点圆绘制步骤.png" alt="formation flight" width="700">
+</center>
+
+- 状态机中实时检测当前鼠标的按下状态，如下的switch一直被轮询，间隔约为10ms。默认是等待鼠标按下状态。
+
+<center  class="half">
+    <img src="images/原理说明/三点圆绘图状态机.png" alt="formation flight" width="600">
+</center>
+
+  > `DRAWING_3P_CIRCLE_WAIT_FIRST_CLIKCKED`：等待鼠标第一次点击。
+  > `DRAWING_3P_CIRCLE_MOVING_FIRST`：鼠标第一次点击后，在移动的过程中。
+  > `images`：本README.md相关图片资源文件。
