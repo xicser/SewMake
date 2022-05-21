@@ -64,7 +64,7 @@ SewMake在启动的时候会自动检查更新，当然也可以手动更新，�
 ## 客户端远程升级
 - 客户端分为两部分，`主程序SewMake`和`升级程序Upgrade`，主程序启动时会自动去web服务器上获取最新版本号，和本地对比，如果发现可升级就提示用户是否升级。
 <center  class="half">
-    <img src="images/原理说明/SewMake更新流程.jpg" alt="formation flight" width="500">
+    <img src="images/原理说明/SewMake更新流程.jpg" alt="formation flight" width="400">
 </center>
 
 - 当用户确认升级时，启动升级程序这个子进程。升级程序会去web服务器上GET新版本主程序zip包，还会获取这个新版主程序zip包的MD5校验值。整个过程主程序处于等待`wait upgrade`状态。
@@ -74,7 +74,7 @@ SewMake在启动的时候会自动检查更新，当然也可以手动更新，�
 - 期间只要任何一步出错，如MD5校验失败，或者解压失败等，都会给主程序发送upgrade cancel消息，让主程序结束等待，然后升级程序退出，主程序提示用户本次升级失败错误原因。
 
 <center  class="half">
-    <img src="images/原理说明/Upgrade更新流程.jpg" alt="formation flight" width="300">
+    <img src="images/原理说明/Upgrade更新流程.jpg" alt="formation flight" width="500">
 </center>
 
 ## web server
