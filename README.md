@@ -9,6 +9,7 @@
 
 - 下面的动图如果看不清，您可以点击图片<font color=#FF0000 > 放大 </font>查看。
 
+-----
 
 # 主要功能
 SewMake的功能主要分为两个主要部分。
@@ -29,9 +30,9 @@ SewMake可以像CAD一样设计自己需要的缝纫花型，目前支持的花�
 ## 远程升级
 SewMake在启动的时候会自动检查更新，当然也可以手动更新，下面这幅图展示了它的自动更新功能。
 <img src="images/远程升级.gif" alt="formation flight" width="1920">
-远程升级的时候，SewMake会去http服务器上获取最新版本的软件，然后经过MD5校验，此后解压软件包，确认无误才会更新本地的旧版本软件。
+远程升级的时候，SewMake会去web server服务器上获取最新版本的软件，然后经过MD5校验，此后解压软件包，确认无误才会更新本地的旧版本软件。
 
->使用libevent库在云服务器上实现了远程升级中要使用的http服务器。
+> 在云服务器上实现了远程升级中要使用的web server服务器。
 
 ## 模拟缝纫
 设计好缝纫花型后，可以进行模拟缝纫，以观察实际的缝纫效果是否符合预期。
@@ -55,8 +56,10 @@ SewMake在启动的时候会自动检查更新，当然也可以手动更新，�
 <img src="images/批量处理.gif" alt="formation flight" width="1920">
 可设置的内容包括改变图形头尾长度、镜像、旋转等等。
 
+-----
+
 # 重点功能实现原理
-## 远程升级
+## 客户端远程升级
 <center  class="half">
     <img src="images/原理说明/Upgrade更新流程.jpg" alt="formation flight" width="300">
     <img src="images/原理说明/SewMake更新流程.jpg" alt="formation flight" width="400">
@@ -70,6 +73,18 @@ SewMake在启动的时候会自动检查更新，当然也可以手动更新，�
 
 - 期间只要任何一步出错，如MD5校验失败，或者解压失败等，都会给主程序发送upgrade cancel消息，让主程序结束等待，然后升级程序退出，主程序提示用户本次升级失败错误原因。
 
+## web server
+采用reactor的工作方式。一个监听线程 + 若干工作线程。
+<img src="images/原理说明/服务器原理.png" alt="formation flight" width="1000">
+
+- 主线程往`epoll`内核事件表中注册`连接socket`读就绪事件。
+- 主线程调用`epoll_wait`等待`socket`上有数据可读。
+- 当`socket`上有数据可读时（要么是连接套接字可读，要么通信套接字可读），`epoll_wait`通知主线程。主线程则将`socket`可读事件放入线程池请求队列。
+- 睡眠在请求队列上的某个工作线程被唤醒，如果是连接套接字，工作线程分配新的通信`socket`，并加入`epoll`内核事件以对其进行监听；如果是通信套接字，工作线程从`socket`读取数据，并处理客户请求（http request），然后往`epoll`内核事件表中注册该`socket`上的写就绪事件。
+- 当主线程继续调用`epoll_wait`等待`socket`可写。
+- 当`socket`可写时，`epoll_wait`通知主线程。主线程将`socket`可写事件放入请求队列。
+- 睡眠在请求队列上的某个工作线程被唤醒，它往`socket`上写入服务器处理客户请求的结果（http response）。
+
 ## 撤销和重做
 <center  class="half">
     <img src="images/原理说明/撤销和重做.png" alt="formation flight" width="500">
@@ -81,22 +96,90 @@ SewMake在启动的时候会自动检查更新，当然也可以手动更新，�
 
 ## CAD绘图状态机
 <center  class="half">
-    <img src="images/原理说明/CAD绘图机制.png" alt="formation flight" width="400">
-    <img src="images/原理说明/CAD绘图演示.gif" alt="formation flight" width="445">
+    <img src="images/原理说明/CAD绘图机制.png" alt="formation flight" width="460">
+    <img src="images/原理说明/CAD绘图演示.gif" alt="formation flight" width="400">
 </center>
 
-- 作图采用状态机原理，现以绘制三点圆为例，说明该状态机的实现原理。
-- 通过分析，枚举出绘制三点圆的所有状态：
+作图采用状态机原理，现以绘制矩形为例，说明该状态机的实现原理：
+- 通过分析，枚举出绘制矩形的所有状态：
+
+```C++
+    //矩形绘制步骤枚举
+    typedef enum {
+        DRAWING_RECT_WAIT_FIRST_CLIKCKED,             //等待鼠标第一次按下
+        DRAWING_RECT_MOVING,                          //鼠标移动中
+        DRAWING_RECT_SECOND_CLIKCKED                  //鼠标第二次按下
+    } Rectangle_Steps_t;
+```
+
+- 状态机中实时检测当前鼠标的按下状态，如下的switch一直被轮询，间隔约为20ms，一直在刷新显示。默认是等待鼠标按下状态。
+
+```C++
+switch (rectangleStatus) {
+
+    //等待鼠标第一次点击
+    case DRAWING_RECT_WAIT_FIRST_CLIKCKED: {
+        if (this->isDrawingLeftBtnClicked == true) {
+            this->isDrawingLeftBtnClicked = false;      //清除点击状态
+            
+            rectangleStatus = DRAWING_RECT_MOVING;      //切换至鼠标移动状态
+            rectangleFirstPoint = ... ...               //记录第一个点
+        }
+        break;
+    }
+
+    //鼠标移动中
+    case DRAWING_RECT_MOVING: {
+
+        //实时绘制矩形
+        painter.drawRect(QRect( this->mapFromScene(rectangleFirstPoint), this->mouseViewPos));
+
+        //移动过程中又点击了一下
+        if (this->isDrawingLeftBtnClicked == true) {
+            this->isDrawingLeftBtnClicked = false;      //清除点击状态
+
+            rectangleStatus = DRAWING_RECT_SECOND_CLIKCKED; //切换至鼠标第二次点击状态
+            rectangleSecondPoint = ... ...                  //记录第二个点
+        }
+        break;
+    }
+
+    //切换只鼠标第二次点击
+    case DRAWING_RECT_SECOND_CLIKCKED: {
+
+        stopStateMachine();         //停止状态机, 降低cpu占用率
+        dumpViewToInterface(rectangleFirstPoint, rectangleSecondPoint); //向底层接口导入矩形数据
+        dumpInterfaceToScene();     //显示最新的底层接口数据
+
+        break;
+    }
+```
+
+  > `DRAWING_RECT_WAIT_FIRST_CLIKCKED`：等待鼠标第一次点击。
+  > `DRAWING_RECT_MOVING`：鼠标第一次点击后，处于移动的过程中（此时还未点击`第二个点`）。此过程实时获取`鼠标位置`，实时绘制`第一个点`到当前`鼠标位置`确定的矩形。
+  > `DRAWING_RECT_SECOND_CLIKCKED`：鼠标点击第二次点击后，绘制矩形需要的两个点都已确定，最后写进数据接口即可。
+
+## 定位到轮廓线
 <center  class="half">
-    <img src="images/原理说明/三点圆绘制步骤.png" alt="formation flight" width="700">
+    <img src="images/原理说明/定位到轮廓线.png" alt="formation flight" width="350">
+    <img src="images/原理说明/定位到轮廓线演示.gif" alt="formation flight" width="460">
 </center>
 
-- 状态机中实时检测当前鼠标的按下状态，如下的switch一直被轮询，间隔约为10ms。默认是等待鼠标按下状态。
+在绘制CAD图形的时候，可以让鼠标当前附着在已有的线上，实现原理如下：
+ - 调用底层接口获取图形上的细分点坐标（图上绿色的密集的点），然后利用如下公式计算一个key：
+```C++
+int key = (int)tmpX / 10 * 1000000 + (int)tmpY / 10; 
+```
+10是网格的高度和宽度，tmpX和tmpY是线上面细分点的坐标。作用让同一个格子里的点，他们的key都相同。
 
-<center  class="half">
-    <img src="images/原理说明/三点圆绘图状态机.png" alt="formation flight" width="600">
-</center>
+ - 用hashMap存储key相同的点，也就是同一个格子里的点都在同一个key下面。
+unordered_map<int, vector<QPointF>> mapStitch;
+vector<QPointF>存放的就是某个格子里的点的坐标集合。
 
-  > `DRAWING_3P_CIRCLE_WAIT_FIRST_CLIKCKED`：等待鼠标第一次点击。
-  > `DRAWING_3P_CIRCLE_MOVING_FIRST`：鼠标第一次点击后，在移动的过程中。
-  > `images`：本README.md相关图片资源文件。
+ - 同样还是使用这个公式计算当前鼠标坐标（x, y）的key，就能得到当前鼠标的位置在哪个格子里。用这个key就能取出格子里的所有细分点坐标vector。
+```C++
+int key = (int)tmpX / 10 * 1000000 + (int)tmpY / 10; 
+```
+
+ - 计算鼠标坐标离vector中哪个点最近，状态机中实时绘图的时候，定位到这个点即可。
+ - 这样做只需要遍历某个格子里的细分点即可，节省大量查询时间。
