@@ -3,12 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
-#include <unistd.h>
-
-#include <sys/types.h>
-#include <sys/stat.h>
-#include "codec.h"
 
 /* 通过文件名获取文件的类型 */
 const char *get_file_type(const char *name)
@@ -53,90 +47,4 @@ const char *get_file_type(const char *name)
 
     return "text/plain; charset=utf-8";
 }
-
-/* 获取某一个目录下的文件和目录, 并拼接一个html文件到out_buffer */
-int get_entry(const char *path, char *out_buffer)
-{
-    int is_root = 0;
-    DIR *dp;
-    char tmpstr[4096];
-    char enstr[4096];
-
-    struct dirent *dp1 = (struct dirent *)malloc(sizeof(struct dirent));
-    struct dirent *dentry = (struct dirent *)malloc(sizeof(struct dirent));
-
-    dp = opendir(path);
-    if (dp == NULL) {
-        perror("opendir error");
-        return -1;
-    }
-
-    //判断是否在资源根目录
-    if (strcmp(path, ".") == 0) {
-        is_root = 1;
-    }
-
-    int cnt = sprintf(out_buffer, "<html><head><title>目录名: %s</title></head>", path);
-    cnt += sprintf(out_buffer + cnt, "<body><h1>当前目录: %s</h1><table>", path);
-
-    while (1) {
-        int ret = readdir_r(dp, dp1, &dentry);
-        if (ret != 0) {
-            perror("readdir_r");
-            exit(EXIT_FAILURE);
-        }
-
-        if (dentry == NULL) {
-            break;
-        }
-
-        //拼接文件的完整路径
-        sprintf(tmpstr, "%s/%s", path, dentry->d_name);
-        struct stat st;
-        stat(tmpstr, &st);
-
-        //编码生成 %E5 %A7 之类的东西
-        encode_str(enstr, sizeof(enstr), dentry->d_name);
-
-        //目录
-        if (dentry->d_type == DT_DIR) {
-
-            if (strcmp(dentry->d_name, ".") == 0) {
-                if (is_root == 0) {
-                    cnt += sprintf(out_buffer + cnt,
-                        "<tr><td><a href=\"%s/\">%s/</a></td><td>%ld</td></tr>",
-                        ".", ".", st.st_size);
-                }
-            }
-            else if (strcmp(dentry->d_name, "..") == 0) {
-                if (is_root == 0) {
-                    cnt += sprintf(out_buffer + cnt,
-                        "<tr><td><a href=\"%s/\">%s/</a></td><td>%ld</td></tr>",
-                        "..", "..", st.st_size);
-                }
-            }
-            else {
-                cnt += sprintf(out_buffer + cnt,
-                    "<tr><td><a href=\"%s/\">%s/</a></td><td>%ld</td></tr>",
-                    enstr, dentry->d_name, st.st_size);
-            }
-        }
-        //文件
-        else {
-            cnt += sprintf(out_buffer + cnt,
-                    "<tr><td><a href=\"%s\">%s</a></td><td>%ld</td></tr>",
-                    enstr, dentry->d_name, st.st_size);
-        }
-    }
-
-    cnt += sprintf(out_buffer + cnt, "</table></body></html>");
-
-    closedir(dp);
-
-    free(dp1);
-    free(dentry);
-
-    return cnt;
-}
-
 

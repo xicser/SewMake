@@ -1,13 +1,25 @@
 #include "http_server.h"
+#include <dirent.h>
+#include <unistd.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <assert.h>
+
 
 int HttpServer::epollfd;
 HttpServer::EventInfoBlock_t HttpServer::g_events[MAX_LISTEN_EVENTS + 1];
+HttpServer* HttpServer::serverPtr;
+set<int> HttpServer::actCommfdSet;
+mutex HttpServer::mux;
 
 HttpServer::HttpServer(int backlog, int serverPort, int threadCount, string workDir)
 {
     this->backlog = backlog;
     this->serverPort = serverPort;
     this->workDir = workDir;
+
+    this->serverPtr = this;
 
     printf("backlog = %d\n", this->backlog);
     printf("serverPort = %d\n", this->serverPort);
@@ -22,9 +34,51 @@ HttpServer::~HttpServer()
     close(listenSockfd);
 }
 
+void HttpServer::addsig(int sig)
+{
+    struct sigaction sa;
+    memset( &sa, '\0', sizeof( sa ) );
+    sa.sa_handler = sigAlarmHandler;
+    sa.sa_flags |= SA_RESTART;
+    sigfillset( &sa.sa_mask );
+    assert( sigaction( sig, &sa, NULL ) != -1 );
+}
+
+/* 闹钟信号handler */
+void HttpServer::sigAlarmHandler(int signum)
+{
+    mux.lock();
+    //记录当前活跃文件描述符的快照, 此后新加入的, 不关心
+    set<int> actCommfdSetCopy = actCommfdSet;
+    mux.unlock();
+
+    for (int fd : actCommfdSetCopy) {
+        if (fd == serverPtr->listenSockfd) {
+            continue;
+        }
+
+        g_events[fd].ticks--;
+        int ticks = g_events[fd].ticks.load();
+        if (ticks <= 0) {
+
+            LOG_PRINT("server close commfd: %d\n", fd);
+
+            //非活跃了, 服务器主动断开连接
+            eventDel(epollfd, &g_events[fd]);
+            close(fd);
+        }
+    }
+
+    alarm(TIMER_SHOT);
+}
+
 void HttpServer::serverInit(void)
 {
     int ret;
+
+    //检测非活跃连接
+    addsig(SIGALRM);
+    alarm(TIMER_SHOT);
 
     //创建连接套接字
     listenSockfd = socket(AF_INET, SOCK_STREAM, 0);  //IPv4, 基于字节流的通信, 即TCP
@@ -32,6 +86,8 @@ void HttpServer::serverInit(void)
         perror("socket error");
         exit(1);
     }
+
+    LOG_PRINT("listenSockfd = %d\n", listenSockfd);
 
     //设置在2msl阶段, 端口可复用
     int opt = 1;
@@ -62,11 +118,13 @@ void HttpServer::serverInit(void)
         exit(1);
     }
 
+    LOG_PRINT("epollfd = %d\n", epollfd);
+
     //把监听fd设置成非阻塞方式
     setFileDescriptor(listenSockfd, true);
 
     //把监听fd挂到红黑树上, 设置成边沿触发方式
-    eventSet(&g_events[MAX_LISTEN_EVENTS], listenSockfd, -1, -1, acceptConn, &g_events[MAX_LISTEN_EVENTS]);
+    eventSet(&g_events[MAX_LISTEN_EVENTS], listenSockfd, -1, acceptConn, &g_events[MAX_LISTEN_EVENTS]);
     eventAdd(epollfd, EPOLLIN | EPOLLET, &g_events[MAX_LISTEN_EVENTS]);
 }
 
@@ -80,25 +138,22 @@ void HttpServer::run(void)
                 perror("epoll_wait error");
                 exit(3);
             }
+            continue;
         }
 
-        for (int i = 0; i < ready; i++)
-        {
+        for (int i = 0; i < ready; i++) {
+
             //eventadd()函数中, 添加到监听树中监听事件的时候将EventInfoBlock_t结构体类型给了ptr指针
             //这里epoll_wait返回的时候, 同样会返回对应fd的EventInfoBlock_t类型的指针
             EventInfoBlock_t *ev = (EventInfoBlock_t *)eventReady[i].data.ptr;
 
             //如果发生的是读事件, 并且监听的是读事件
-            if ((eventReady[i].events & EPOLLIN) && (ev->events & EPOLLIN))
-            {
+            if ((eventReady[i].events & EPOLLIN) && (ev->events & EPOLLIN)) {
                 threadpool.append(ev);
-            //    ev->call_back(ev->fd, eventReady[i].events, ev->arg);
             }
             //如果发生的是写事件, 并且监听的是写事件
-            else if ((eventReady[i].events & EPOLLOUT) && (ev->events & EPOLLOUT))
-            {
+            else if ((eventReady[i].events & EPOLLOUT) && (ev->events & EPOLLOUT)) {
                 threadpool.append(ev);
-            //    ev->call_back(ev->fd, eventReady[i].events, ev->arg);
             }
         }
     }
@@ -124,40 +179,23 @@ void HttpServer::acceptConn(int lfd, int events, void *arg)
                 inet_ntop(AF_INET, &client_addr.sin_addr.s_addr, ip_str, sizeof(ip_str)), 
                 ntohs(client_addr.sin_port));
 #endif
-
-        //把这个通信套接字加到红黑树上, 设置成边沿触发方式
-        //从全局数组g_events中找一个空闲位置
-        int i = 0;
-        for (; i < MAX_LISTEN_EVENTS; i++)
-        {
-            if (g_events[i].status == 0) {
-                break;
-            }
-        }
-        if (i == MAX_LISTEN_EVENTS) // 超出连接数上限
-        {
-            printf("%s: max connect limit[%d]\n", __func__, MAX_LISTEN_EVENTS);
-            break;
-        }
-
-        //清空写入写出缓冲buffer
-        g_events[i].recvlen = 0;
-        g_events[i].sendlen = 0;
-
         //把这个通信套接字设置成非阻塞
         setFileDescriptor(commfd, true);
 
-        //找到合适的节点之后, 将其添加到监听树中, 并监听读事件
-        eventSet(&g_events[i], commfd, -1, -1, recvDataAndCope, &g_events[i]);
-        eventAdd(epollfd, EPOLLIN | EPOLLET | EPOLLONESHOT, &g_events[i]);
+        //用commfd作为下标, 一定不会冲突, 将其添加到监听树中, 并监听读事件
+        eventSet(&g_events[commfd], commfd, 0, recvData, &g_events[commfd]);
+        eventAdd(epollfd, EPOLLIN | EPOLLET | EPOLLONESHOT, &g_events[commfd]);
     }
 }
 
-/* 接收数据并处理 */
-void HttpServer::recvDataAndCope(int fd, int events, void *arg)
+/* 接收数据 */
+void HttpServer::recvData(int fd, int events, void *arg)
 {
     EventInfoBlock_t *ev = (EventInfoBlock_t *)arg;
     int len = 0;
+
+    //重设活跃ticks
+    ev->ticks.store(ACTIVE_TICKS);
 
     int readStep = 1024;
     while (1) {
@@ -179,12 +217,10 @@ void HttpServer::recvDataAndCope(int fd, int events, void *arg)
     if (len == 0) {
         //对端关闭
         close(ev->fd);
-        LOG_PRINT("client [fd=%d] pos[%ld], closed\n\n\n", fd, ev-g_events);
+        LOG_PRINT("client [commfd = %d] pos[%ld], closed\n\n", fd, ev-g_events);
 
         return;
     }
-
-    ev->recvlen = len;
 
 #ifdef LOG_ENABLE
         //LOG_PRINT("read content\n\n");
@@ -192,23 +228,23 @@ void HttpServer::recvDataAndCope(int fd, int events, void *arg)
         //LOG_PRINT("read content: [%d]:\n%s\n", fd, ev->recvbuf);
 #endif
 
-    /* 业务逻辑处理 */
-    doHttpRequest(ev);
-
-    eventSet(ev, fd, 0, -1, sendData, ev);              //设置该fd对应的回调函数为sendData
+    eventSet(ev, fd, len, sendDataAndCope, ev);         //设置该fd对应的回调函数为sendData
     eventAdd(epollfd, EPOLLOUT | EPOLLONESHOT, ev);     //将fd加入红黑树中, 监听其写事件
 }
 
-/* 发送数据 */
-void HttpServer::sendData(int fd, int events, void *arg)
+/* 处理数据并发送 */
+void HttpServer::sendDataAndCope(int fd, int events, void *arg)
 {
     EventInfoBlock_t *ev = (EventInfoBlock_t *)arg;
+
+    //重设活跃ticks
+    ev->ticks.store(ACTIVE_TICKS);
 
     //把这个通信套接字设置成阻塞
     setFileDescriptor(fd, false);
 
-    //写回
-    write(fd, ev->sendbuf, ev->sendlen);
+    /* 业务逻辑处理 */
+    doHttpRequest(ev);
 
     //把这个通信套接字设置成非阻塞
     setFileDescriptor(fd, true);
@@ -219,7 +255,8 @@ void HttpServer::sendData(int fd, int events, void *arg)
 #endif
 
     eventDel(epollfd, ev);                        //从红黑树中移除
-    eventSet(ev, fd, 0, 0, recvDataAndCope, ev);  //将该fd的回调函数改为recvData
+//    close(fd);  //如果要测试webbench, 发送完成后, 要主动关闭连接
+    eventSet(ev, fd, 0, recvData, ev);            //将该fd的回调函数改为recvData
     eventAdd(epollfd, EPOLLIN | EPOLLET | EPOLLONESHOT, ev);     //重新添加到红黑树上, 设为监听读事件
 }
 
@@ -238,53 +275,56 @@ void HttpServer::setFileDescriptor(int fd, bool nonblock)
     fcntl(fd, F_SETFL, flag); 
 }
 
-/* 构造http回复报文头 */
-int HttpServer::httpBuildResponseMsgHeader(int no, const char *describe, const char *type, int len, char *out_buffer)
+/* 发送http回复报文头 */
+void HttpServer::httpSendResponseMsgHeader(int no, const char *describe, const char *type, int len, EventInfoBlock_t* ev)
 {
     int cnt = 0;
+    char* buffer = ev->sendbuf;
 
-    cnt = sprintf(out_buffer, "http/1.1 %d %s\r\n", no, describe);        //状态行
-    cnt += sprintf(out_buffer + cnt, "Content-Type:%s\r\n", type);        //类型
-    cnt += sprintf(out_buffer + cnt, "Content-Length:%d\r\n", len);       //长度
-    cnt += sprintf(out_buffer + cnt, "\r\n");                             //空行
+    cnt = sprintf(buffer, "http/1.1 %d %s\r\n", no, describe);        //状态行
+    cnt += sprintf(buffer + cnt, "Content-Type:%s\r\n", type);        //类型
+    cnt += sprintf(buffer + cnt, "Content-Length:%d\r\n", len);       //长度
+    cnt += sprintf(buffer + cnt, "\r\n");                             //空行
 
-    return cnt;
+    write(ev->fd, buffer, cnt);
 }
 
-/* 构造http错误报文 */
-int HttpServer::httpBuildErrorMsg(int no, const char *describe, const char *text, char *out_buffer)
+/* 发送http错误报文 */
+void HttpServer::httpSendErrorMsg(int no, const char *describe, const char *text, EventInfoBlock_t* ev)
 {
+    char* buffer = ev->sendbuf;
     int cnt = 0;
 
-    cnt = sprintf(out_buffer, "%s %d %s\r\n", "HTTP/1.1", no, describe);
-    cnt += sprintf(out_buffer + cnt, "Content-Type:%s\r\n", "text/html");
-    cnt += sprintf(out_buffer + cnt, "Content-Length:%d\r\n", -1);
-    cnt += sprintf(out_buffer + cnt, "Connection: close\r\n");
-    cnt += sprintf(out_buffer + cnt, "\r\n");
+    cnt = sprintf(buffer, "%s %d %s\r\n", "HTTP/1.1", no, describe);
+    cnt += sprintf(buffer + cnt, "Content-Type:%s\r\n", "text/html");
+    cnt += sprintf(buffer + cnt, "Content-Length:%d\r\n", -1);
+    cnt += sprintf(buffer + cnt, "Connection: close\r\n");
+    cnt += sprintf(buffer + cnt, "\r\n");
 
-    cnt += sprintf(out_buffer + cnt, "<html><head><title>%d %s</title></head>\n", no, describe);
-    cnt += sprintf(out_buffer + cnt, "<body bgcolor=\"#cc99cc\"><h2 align=\"center\">%d %s</h4>\n", no, describe);
-    cnt += sprintf(out_buffer + cnt, "%s\n", text);
-    cnt += sprintf(out_buffer + cnt, "<hr>\n</body>\n</html>\n");
+    cnt += sprintf(buffer + cnt, "<html><head><title>%d %s</title></head>\n", no, describe);
+    cnt += sprintf(buffer + cnt, "<body bgcolor=\"#cc99cc\"><h2 align=\"center\">%d %s</h4>\n", no, describe);
+    cnt += sprintf(buffer + cnt, "%s\n", text);
+    cnt += sprintf(buffer + cnt, "<hr>\n</body>\n</html>\n");
 
-    return cnt;
+    write(ev->fd, buffer, cnt);
 }
 
-/* 填充文件内容 */
-int HttpServer::httpBuildFile(const char *filepath, char* outerBuffer)
+/* 发送文件内容 */
+void HttpServer::httpSendFile(const char *filepath, EventInfoBlock_t* ev)
 {
+    char* sendBuffer = ev->sendbuf;
+
     //打开文件
     int fd = open(filepath, O_RDONLY);
     if(fd == -1) {
-        int len = httpBuildErrorMsg(404, "Not Found", "No such file or directory", outerBuffer);
-        return len;
+        httpSendErrorMsg(404, "Not Found", "No such file or directory", ev);
+        return;
     }
 
     //读文件
-    int len = 0;
     while (1) {
-        int ret = read(fd, outerBuffer + len, 1024);
-        if (len == -1) {
+        int ret = read(fd, sendBuffer, 1024 * 35);
+        if (ret == -1) {
             perror("read file error");
             break;
         }
@@ -293,20 +333,104 @@ int HttpServer::httpBuildFile(const char *filepath, char* outerBuffer)
             break;
         }
         else {
-            len += ret;
+            write(ev->fd, sendBuffer, ret);
         }
+
+        //重设活跃ticks
+        ev->ticks.store(ACTIVE_TICKS);
     }
 
     close(fd);
-
-    return len;
 }
 
-/* 填充目录内容 */
-int HttpServer::httpBuildDir(const char *dirpath, char* outerBuffer)
+/* 发送目录内容 */
+void HttpServer::httpSendDir(const char *dirpath, EventInfoBlock_t* ev)
 {
-    int len = get_entry(dirpath, outerBuffer);
-    return len;
+    int is_root = 0;
+    DIR *dp;
+    char tmpstr[4096];
+    char enstr[4096];
+    char* sendBuffer = ev->sendbuf;
+
+    struct dirent *dp1 = (struct dirent *)malloc(sizeof(struct dirent));
+    struct dirent *dentry = (struct dirent *)malloc(sizeof(struct dirent));
+
+    dp = opendir(dirpath);
+    if (dp == NULL) {
+        perror("opendir error");
+        return;
+    }
+
+    //判断是否在资源根目录
+    if (strcmp(dirpath, ".") == 0) {
+        is_root = 1;
+    }
+
+    int cnt = sprintf(sendBuffer, "<html><head><title>目录名: %s</title></head>", dirpath);
+    cnt += sprintf(sendBuffer + cnt, "<body><h1>当前目录: %s</h1><table>", dirpath);
+
+    while (1) {
+
+        //重设活跃ticks
+        ev->ticks.store(ACTIVE_TICKS);
+
+        int ret = readdir_r(dp, dp1, &dentry);
+        if (ret != 0) {
+            perror("readdir_r");
+            exit(EXIT_FAILURE);
+        }
+
+        if (dentry == NULL) {
+            break;
+        }
+
+        //拼接文件的完整路径
+        sprintf(tmpstr, "%s/%s", dirpath, dentry->d_name);
+        struct stat st;
+        stat(tmpstr, &st);
+
+        //编码生成 %E5 %A7 之类的东西
+        encode_str(enstr, sizeof(enstr), dentry->d_name);
+
+        //目录
+        if (dentry->d_type == DT_DIR) {
+
+            if (strcmp(dentry->d_name, ".") == 0) {
+                if (is_root == 0) {
+                    cnt += sprintf(sendBuffer + cnt,
+                        "<tr><td><a href=\"%s/\">%s/</a></td><td>%ld</td></tr>",
+                        ".", ".", st.st_size);
+                }
+            }
+            else if (strcmp(dentry->d_name, "..") == 0) {
+                if (is_root == 0) {
+                    cnt += sprintf(sendBuffer + cnt,
+                        "<tr><td><a href=\"%s/\">%s/</a></td><td>%ld</td></tr>",
+                        "..", "..", st.st_size);
+                }
+            }
+            else {
+                cnt += sprintf(sendBuffer + cnt,
+                    "<tr><td><a href=\"%s/\">%s/</a></td><td>%ld</td></tr>",
+                    enstr, dentry->d_name, st.st_size);
+            }
+        }
+        //文件
+        else {
+            cnt += sprintf(sendBuffer + cnt,
+                    "<tr><td><a href=\"%s\">%s</a></td><td>%ld</td></tr>",
+                    enstr, dentry->d_name, st.st_size);
+        }
+    }
+
+    cnt += sprintf(sendBuffer + cnt, "</table></body></html>");
+
+    closedir(dp);
+
+    free(dp1);
+    free(dentry);
+
+    write(ev->fd, sendBuffer, cnt);
 }
 
 /* 处理http请求 */
@@ -335,11 +459,11 @@ void HttpServer::doHttpRequest(EventInfoBlock_t *ev)
         else {
             filepath = path + 1;
         }
+        LOG_PRINT("got %s ...\n", filepath);
     }
     else {
         printf("unrecognized request\n");
-        int len = httpBuildErrorMsg(405, "Not Found", "Can not cope your request", ev->sendbuf);
-        ev->sendlen += len;
+        httpSendErrorMsg(405, "Not Found", "Can not cope your request", ev);
         return;
     }
 
@@ -347,39 +471,36 @@ void HttpServer::doHttpRequest(EventInfoBlock_t *ev)
     int ret = stat(filepath, &sbuf);
     if (ret != 0) {
         //回发浏览器 404 错误页面
-        int len = httpBuildErrorMsg(404, "Not Found", "No such file or directory", ev->sendbuf);
-        ev->sendlen += len;
+        httpSendErrorMsg(404, "Not Found", "No such file or directory", ev);
         return;
     }
 
     //文件
     if (S_ISREG(sbuf.st_mode)) {
 
-        //构造回发报文头
-        int len = httpBuildResponseMsgHeader(200, "OK", get_file_type(filepath), sbuf.st_size, ev->sendbuf);
-        ev->sendlen += len;
+        //发送回发报文头
+        httpSendResponseMsgHeader(200, "OK", get_file_type(filepath), sbuf.st_size, ev);
 
-        //填充文件内容
-        len = httpBuildFile(filepath, ev->sendbuf + ev->sendlen);
-        ev->sendlen += len;
+        //发送文件内容
+        httpSendFile(filepath, ev);
     }
     //目录
     else if (S_ISDIR(sbuf.st_mode)) {
 
-        //构造回发报文头
-        int len = httpBuildResponseMsgHeader(200, "OK", get_file_type(".html"), -1, ev->sendbuf);
-        ev->sendlen += len;
+        //发送回发报文头
+        httpSendResponseMsgHeader(200, "OK", get_file_type(".html"), -1, ev);
 
-        //填充目录内容
-        len = httpBuildDir(filepath, ev->sendbuf + ev->sendlen);
-        ev->sendlen += len;
+        //发送目录内容
+        httpSendDir(filepath, ev);
     }
 }
 
 /* 设置一个EventInfoBlock的内容 */
-void HttpServer::eventSet(EventInfoBlock_t *ev, int fd, int rlen, int wlen,
+void HttpServer::eventSet(EventInfoBlock_t *ev, int fd, int rlen,
                             void (*call_back)(int fd,int events,void *arg), void *arg)
 {
+    ev->ticks.store(ACTIVE_TICKS);
+
     ev->fd = fd;
     ev->call_back = call_back;
     ev->events = 0;
@@ -387,10 +508,6 @@ void HttpServer::eventSet(EventInfoBlock_t *ev, int fd, int rlen, int wlen,
     ev->status = 0;
     if(rlen != -1) {
         ev->recvlen = rlen;
-    }
-
-    if (wlen != -1) {
-        ev->sendlen = wlen;
     }
 }
 
@@ -411,6 +528,10 @@ void HttpServer::eventAdd(int efd, int events, EventInfoBlock_t *ev)
         printf("event add failed [fd=%d], events[%d]\n", ev->fd, events);
         perror("epoll_ctl add error");
     }
+
+    mux.lock();
+    actCommfdSet.insert(ev->fd);
+    mux.unlock();
 }
 
 /* 从epoll 监听的 红黑树中删除一个文件描述符 */
@@ -425,5 +546,11 @@ void HttpServer::eventDel(int efd, EventInfoBlock_t *ev)
     {
         perror("epoll_ctl del error");
     }
+
+    mux.lock();
+    actCommfdSet.erase(ev->fd);
+    mux.unlock();
+
+    ev->ticks.store(0);
 }
 

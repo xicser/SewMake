@@ -26,14 +26,19 @@
 #include "logger.h"
 #include "threadpool.h"
 
+#include <atomic>
 #include <string>
+#include <set>
+#include <mutex>
 
 using namespace std;
 
-#define MAX_LISTEN_EVENTS       (99999)
+#define MAX_LISTEN_EVENTS       (65536)     //大于进程支持打开的最大文件描述符个数
 #define EVENT_READY_CNT         (10000)
 #define EVENT_INFO_BUFFLEN      (4096)
 
+#define TIMER_SHOT              (1)         //定时器倒计时时间
+#define ACTIVE_TICKS            (10)        //活跃时间
 
 class HttpServer {
 public:
@@ -54,28 +59,38 @@ private:
         int  status;        //是否在监听: 1->在红黑树上(监听), 0->不在(不监听)
         char recvbuf[EVENT_INFO_BUFFLEN];
         int  recvlen;
-        char sendbuf[EVENT_INFO_BUFFLEN];
+        char sendbuf[EVENT_INFO_BUFFLEN * 10];
         int  sendlen;
+        atomic<int>  ticks;  //保持活跃连接的倒计时
     } EventInfoBlock_t;
 
-    static int  httpBuildResponseMsgHeader(int no, const char *describe, const char *type, int len, char *out_buffer);
-    static int  httpBuildErrorMsg(int no, const char *describe, const char *text, char *out_buffer);
-    static int  httpBuildFile(const char *filepath, char* outerBuffer);
-    static int  httpBuildDir(const char *dirpath, char* outerBuffer);
+    static void httpSendResponseMsgHeader(int no, const char *describe, const char *type, int len, EventInfoBlock_t *);
+    static void httpSendErrorMsg(int no, const char *describe, const char *text, EventInfoBlock_t *);
+    static void httpSendFile(const char *filepath, EventInfoBlock_t *);
+    static void httpSendDir(const char *dirpath, EventInfoBlock_t *);
     static void doHttpRequest(EventInfoBlock_t *);
 
-
-    static EventInfoBlock_t g_events[MAX_LISTEN_EVENTS + 1];    //g_events[MAX_LISTEN_EVENTS]位置是监听套接字的EventInfoBlock
+    //g_events[MAX_LISTEN_EVENTS]位置是监听套接字的EventInfoBlock
+    static EventInfoBlock_t g_events[MAX_LISTEN_EVENTS + 1];
 
     //设置一个EventInfoBlock的内容
-    static void eventSet(EventInfoBlock_t *ev, int fd, int rlen, int wlen, void (*call_back)(int fd, int events, void *arg), void *arg);
+    static void eventSet(EventInfoBlock_t *ev, int fd, int rlen, void (*call_back)(int fd, int events, void *arg), void *arg);
     static void eventAdd(int efd, int events, EventInfoBlock_t *ev);  //向 epoll监听的红黑树 添加一个文件描述符
     static void eventDel(int efd, EventInfoBlock_t *ev);                 //从epoll 监听的 红黑树中删除一个文件描述符
     static void acceptConn(int lfd, int events, void *arg);    //当有文件描述符就绪, epoll返回, 调用该函数与客户端建立链接
 
-    static void recvDataAndCope(int fd, int events, void *arg);           //接收数据并处理
-    static void sendData(int fd, int events, void *arg);                  //发送数据
+    static void recvData(int fd, int events, void *arg);                  //接收数据并处理
+    static void sendDataAndCope(int fd, int events, void *arg);      //发送数据
     static void setFileDescriptor(int fd, bool nonblock);                 //设置文件描述符属性
+
+    static void addsig(int sig);
+    static void sigAlarmHandler(int signum);
+
+private:
+    static HttpServer* serverPtr;
+
+    static set<int> actCommfdSet;    //活跃连接文件描述符集合
+    static mutex mux;
 
     string workDir;           //工作目录
     int listenSockfd;         //监听套接字
